@@ -1,0 +1,27 @@
+[Unit]
+Description=Forge Builder — autonomous agent build loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/forge
+EnvironmentFile=/opt/forge/infra/builder/.env
+ExecStart=/usr/bin/python3 /opt/forge/infra/builder/forge_builder.py
+Restart=on-failure
+RestartSec=60
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forge-builder
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/forge
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
