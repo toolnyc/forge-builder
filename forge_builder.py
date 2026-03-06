@@ -398,26 +398,42 @@ def prepare_branch(issue_number: int, title: str) -> str:
 
 
 def has_changes() -> bool:
-    """Check if there are uncommitted changes."""
-    result = run_cmd(["git", "status", "--porcelain"], check=False)
-    return bool(result.stdout.strip())
+    """Check if there are any changes vs origin/main (committed or uncommitted)."""
+    # Check for uncommitted changes
+    status = run_cmd(["git", "status", "--porcelain"], check=False)
+    if status.stdout.strip():
+        return True
+    # Check for commits ahead of origin/main
+    log_result = run_cmd(
+        ["git", "log", "origin/main..HEAD", "--oneline"],
+        check=False,
+    )
+    return bool(log_result.stdout.strip())
 
 
 def commit_and_push(branch_name: str, issue_number: int, title: str):
-    """Stage all changes, commit, push."""
-    # Ensure secrets and logs are never committed
+    """Squash aider's commits into one clean commit, then push."""
+    # Stage any remaining uncommitted changes
+    run_cmd(["git", "add", "-A"], check=False)
+    status = run_cmd(["git", "status", "--porcelain"], check=False)
+    if status.stdout.strip():
+        run_cmd(["git", "commit", "-m", "wip: remaining changes"], check=False)
+
+    # Ensure secrets and logs are never in the tree
     run_cmd(
         ["git", "reset", "HEAD", "--", "infra/builder/.env", "infra/builder/budget.jsonl"],
         check=False,
     )
     run_cmd(["git", "checkout", "--", "infra/builder/.env"], check=False)
-    run_cmd(["git", "add", "-A"])
+
+    # Squash all commits on this branch into one clean commit
     commit_msg = (
         f"forge-build: {title} (#{issue_number})\n\n"
         f"Autonomously implemented by Forge Builder using aider.\n"
         f"Closes #{issue_number}\n\n"
         f"Co-Authored-By: Forge Builder <forge-builder@noreply.github.com>"
     )
+    run_cmd(["git", "reset", "--soft", "origin/main"])
     run_cmd(["git", "commit", "-m", commit_msg])
     run_cmd(["git", "push", "-u", "origin", branch_name])
 
@@ -481,7 +497,8 @@ def run_aider(
     Returns:
         AiderResult with exit code, output, cost, and timing.
     """
-    prompt = f"""You are working on the Forge project — an open-source agent orchestrator.
+    repo_name = cfg.github_repo.split("/")[-1] if cfg.github_repo else "this project"
+    prompt = f"""You are working on {repo_name} ({cfg.github_repo}).
 
 Implement the following GitHub issue:
 
@@ -494,7 +511,10 @@ Implement the following GitHub issue:
 Instructions:
 - Read CLAUDE.md first for project conventions
 - Make focused, minimal changes to implement this issue
+- Create new files when needed — don't just modify config
+- If you add dependencies, run the install command (npm install, pip install, etc.)
 - Write tests if the project has a test framework set up
+- Run the build command to verify your changes compile (npm run build, cargo check, etc.)
 - Do NOT modify unrelated code
 - If you're blocked or something is unclear, leave a TODO comment explaining why
 """
@@ -505,7 +525,6 @@ Instructions:
     cmd = [
         "aider",
         "--yes",
-        "--no-auto-commits",
         "--model", model,
         "--message", prompt,
     ]
@@ -563,15 +582,94 @@ Instructions:
     )
 
 # ---------------------------------------------------------------------------
+# Post-aider fixups
+# ---------------------------------------------------------------------------
+
+_NPM_INSTALL_RE = re.compile(
+    r"(?:npm|pnpm|yarn)\s+(?:install|add)\s+((?:[\w@/._-]+\s*)+)",
+)
+_PIP_INSTALL_RE = re.compile(
+    r"pip\s+install\s+([\w@/._ -]+)",
+)
+
+
+def _auto_install_deps(aider_result: AiderResult):
+    """Install dependencies that aider tells the user to install.
+
+    Aider can't run shell commands. It often creates files with new imports
+    and then says "run: npm install foo bar". We parse that and run it.
+    Also handles package.json/requirements.txt changes.
+    """
+    repo = Path(cfg.repo_dir)
+    combined_output = (aider_result.stdout or "") + "\n" + (aider_result.stderr or "")
+
+    # Check what files changed
+    result = run_cmd(
+        ["git", "diff", "--name-only", "origin/main"],
+        check=False,
+    )
+    changed = set(result.stdout.strip().splitlines())
+
+    # --- Node.js ---
+    if (repo / "package.json").exists():
+        # Parse install commands from aider output
+        packages = []
+        for match in _NPM_INSTALL_RE.finditer(combined_output):
+            pkgs = match.group(1).strip().split()
+            for p in pkgs:
+                if not p.startswith("-") and p not in packages:
+                    packages.append(p)
+
+        if packages or "package.json" in changed:
+            if (repo / "pnpm-lock.yaml").exists():
+                pm = "pnpm"
+            elif (repo / "yarn.lock").exists():
+                pm = "yarn"
+            else:
+                pm = "npm"
+
+            if packages:
+                install_cmd = [pm, "install"] + packages
+            else:
+                install_cmd = [pm, "install"]
+
+            log.info("Installing deps: %s", " ".join(install_cmd))
+            install_result = run_cmd(install_cmd, check=False)
+            if install_result.returncode != 0:
+                log.warning("Dep install failed: %s", install_result.stderr[-500:])
+            else:
+                # Commit lockfile + package.json changes
+                run_cmd(["git", "add", "-A"], check=False)
+                status = run_cmd(["git", "status", "--porcelain"], check=False)
+                if status.stdout.strip():
+                    run_cmd(
+                        ["git", "commit", "-m", "chore: install dependencies"],
+                        check=False,
+                    )
+
+    # --- Python ---
+    if "requirements.txt" in changed and (repo / "requirements.txt").exists():
+        log.info("requirements.txt changed — running pip install")
+        run_cmd(["pip", "install", "-r", "requirements.txt"], check=False)
+
+    # --- Rust ---
+    if "Cargo.toml" in changed:
+        log.info("Cargo.toml changed — deps will be fetched by cargo check")
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 def _reset_working_tree(branch_name: str):
-    """Hard-reset the working tree for a retry attempt."""
+    """Hard-reset the branch to origin/main for a retry attempt.
+
+    With aider auto-commits, we need to reset committed changes too.
+    """
     run_cmd(["git", "checkout", "--", "."], check=False)
     run_cmd(["git", "clean", "-fd"], check=False)
-    run_cmd(["git", "reset", "--hard", f"origin/main"], check=False)
-    run_cmd(["git", "checkout", branch_name], check=False)
+    # Reset branch pointer + working tree back to origin/main
+    run_cmd(["git", "reset", "--hard", "origin/main"], check=False)
 
 
 def process_issue(issue: dict):
@@ -619,6 +717,8 @@ def process_issue(issue: dict):
         branch_name = prepare_branch(number, title)
 
         extra_context: str | None = None
+        prev_had_src_changes: bool = False
+        prev_build_failed: bool = False
 
         for tier_index, model in enumerate(chain):
             for attempt in range(1, MAX_RETRIES_PER_TIER + 1):
@@ -640,9 +740,14 @@ def process_issue(issue: dict):
                     final_verdict = "give_up"
                     break
 
-                # Reset working tree on retries (not first attempt)
+                # Smart reset: keep aider's work on build failure (code is
+                # good, just needs fixing). Reset on no-changes or no-source
+                # to let aider start fresh.
                 if total_attempts > 1:
-                    _reset_working_tree(branch_name)
+                    if prev_build_failed and prev_had_src_changes:
+                        log.info("Keeping previous changes — retrying to fix build")
+                    else:
+                        _reset_working_tree(branch_name)
 
                 log.info(
                     "Attempt %d (tier %d/%d, model=%s) for #%d",
@@ -650,6 +755,7 @@ def process_issue(issue: dict):
                 )
 
                 aider_result = run_aider(issue, model, extra_context)
+                _auto_install_deps(aider_result)
                 signals = collect_signals(aider_result, cfg.repo_dir)
                 judge_result = determine_verdict(signals, attempt, tier_index)
 
@@ -660,7 +766,7 @@ def process_issue(issue: dict):
                 ):
                     ollama_model = os.getenv("FORGE_OLLAMA_MODEL", "qwen2.5-coder:7b")
                     diff_stat_result = run_cmd(
-                        ["git", "diff", "--stat", "HEAD"], check=False,
+                        ["git", "diff", "--stat", "origin/main"], check=False,
                     )
                     llm_ok = llm_judge_diff(
                         diff_stat_result.stdout, title, ollama_model,
@@ -688,6 +794,13 @@ def process_issue(issue: dict):
                     "Verdict for #%d attempt %d: %s — %s",
                     number, total_attempts,
                     judge_result.verdict.value, judge_result.reason,
+                )
+
+                # Track state for smart reset on next retry
+                prev_had_src_changes = signals.has_src_changes
+                prev_build_failed = (
+                    signals.build_exit_code is not None
+                    and signals.build_exit_code != 0
                 )
 
                 if judge_result.verdict == Verdict.PASS:

@@ -15,6 +15,7 @@ from judge import (
     collect_signals,
     determine_verdict,
     should_run_llm_judge,
+    _detect_build_command,
     MODEL_CHAIN,
     MAX_RETRIES_PER_TIER,
 )
@@ -58,12 +59,14 @@ class TestVerdictPass:
         result = determine_verdict(signals, attempt=1, tier_index=0)
         assert result.verdict == Verdict.PASS
 
-    def test_pass_non_source_changes(self):
+    def test_pass_non_source_changes_after_retries(self):
+        """Non-source changes pass on last tier with retries exhausted."""
+        last_tier = len(MODEL_CHAIN) - 1
         signals = make_signals(
             exit_code=0, has_changes=True, has_src_changes=False,
             files_changed=1, lines_added=5,
         )
-        result = determine_verdict(signals, attempt=1, tier_index=0)
+        result = determine_verdict(signals, attempt=MAX_RETRIES_PER_TIER, tier_index=last_tier)
         assert result.verdict == Verdict.PASS
 
     def test_pass_with_minor_lint_after_retries_exhausted(self):
@@ -110,6 +113,16 @@ class TestVerdictFailRetry:
         result = determine_verdict(signals, attempt=1, tier_index=0)
         assert result.verdict == Verdict.FAIL_RETRY
         assert "file" in result.reason.lower()
+
+    def test_non_source_changes_first_attempt(self):
+        """Only config/docs changes on first attempt triggers retry."""
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=False,
+            files_changed=1, lines_added=5,
+        )
+        result = determine_verdict(signals, attempt=1, tier_index=0)
+        assert result.verdict == Verdict.FAIL_RETRY
+        assert "config" in result.reason.lower() or "source" in result.reason.lower()
 
     def test_generic_failure_first_attempt(self):
         signals = make_signals(exit_code=1)
@@ -376,3 +389,157 @@ class TestScenarios:
             signals, attempt=MAX_RETRIES_PER_TIER, tier_index=last,
         )
         assert result.verdict == Verdict.GIVE_UP
+
+
+# ---------------------------------------------------------------------------
+# Build verification
+# ---------------------------------------------------------------------------
+
+class TestBuildVerification:
+    def test_build_failure_retries(self):
+        """Build failure on first attempt triggers retry with error hint."""
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=True,
+            build_exit_code=1, build_errors="Module not found: clsx",
+        )
+        result = determine_verdict(signals, attempt=1, tier_index=0)
+        assert result.verdict == Verdict.FAIL_RETRY
+        assert "build failed" in result.reason.lower()
+        assert "clsx" in result.retry_hint
+
+    def test_build_failure_escalates(self):
+        """Build failure after retries exhausted escalates."""
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=True,
+            build_exit_code=1, build_errors="Type error",
+        )
+        result = determine_verdict(signals, attempt=MAX_RETRIES_PER_TIER, tier_index=0)
+        assert result.verdict == Verdict.ESCALATE
+
+    def test_build_failure_gives_up_on_last_tier(self):
+        """Build failure on last tier gives up."""
+        last_tier = len(MODEL_CHAIN) - 1
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=True,
+            build_exit_code=1,
+        )
+        result = determine_verdict(
+            signals, attempt=MAX_RETRIES_PER_TIER, tier_index=last_tier,
+        )
+        assert result.verdict == Verdict.GIVE_UP
+
+    def test_build_success_passes(self):
+        """Successful build with src changes passes."""
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=True,
+            build_exit_code=0,
+        )
+        result = determine_verdict(signals, attempt=1, tier_index=0)
+        assert result.verdict == Verdict.PASS
+
+    def test_no_build_command_skipped(self):
+        """When no build command detected, passes without build check."""
+        signals = make_signals(
+            exit_code=0, has_changes=True, has_src_changes=True,
+            build_exit_code=None,
+        )
+        result = determine_verdict(signals, attempt=1, tier_index=0)
+        assert result.verdict == Verdict.PASS
+
+
+class TestDetectBuildCommand:
+    def test_npm_project(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "next build"}}')
+        (tmp_path / "package-lock.json").write_text("{}")
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd == ["npm", "run", "build"]
+
+    def test_pnpm_project(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "vite build"}}')
+        (tmp_path / "pnpm-lock.yaml").write_text("")
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd == ["pnpm", "run", "build"]
+
+    def test_yarn_project(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "tsc"}}')
+        (tmp_path / "yarn.lock").write_text("")
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd == ["yarn", "build"]
+
+    def test_rust_project(self, tmp_path):
+        (tmp_path / "Cargo.toml").write_text("[package]")
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd == ["cargo", "check"]
+
+    def test_go_project(self, tmp_path):
+        (tmp_path / "go.mod").write_text("module example.com/foo")
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd == ["go", "build", "./..."]
+
+    def test_no_build_detected(self, tmp_path):
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd is None
+
+    def test_package_json_without_build_script(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"scripts": {"dev": "next dev"}}')
+        cmd = _detect_build_command(str(tmp_path))
+        assert cmd is None
+
+
+# ---------------------------------------------------------------------------
+# Source file detection
+# ---------------------------------------------------------------------------
+
+class TestSourceFileDetection:
+    @patch("judge.subprocess.run")
+    def test_tsx_files_detected_as_source(self, mock_run):
+        diff_stat = """\
+ src/components/ui/button.tsx | 63 +++++++
+ src/lib/utils.ts             |  6 +
+ .gitignore                   |  1 +
+ 3 files changed, 70 insertions(+)"""
+
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"] and "--stat" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=diff_stat, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+        aider = make_result(exit_code=0)
+        signals = collect_signals(aider, "/tmp/fake")
+        assert signals.has_src_changes
+        assert signals.files_changed == 3
+
+    @patch("judge.subprocess.run")
+    def test_only_config_files_not_source(self, mock_run):
+        diff_stat = """\
+ .gitignore    | 1 +
+ tsconfig.json | 3 +++
+ 2 files changed, 4 insertions(+)"""
+
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"] and "--stat" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=diff_stat, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+        aider = make_result(exit_code=0)
+        signals = collect_signals(aider, "/tmp/fake")
+        assert not signals.has_src_changes
+        assert signals.has_changes
+
+    @patch("judge.subprocess.run")
+    def test_test_files_excluded_from_src(self, mock_run):
+        diff_stat = """\
+ src/utils.test.ts | 20 ++++
+ 1 file changed, 20 insertions(+)"""
+
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"] and "--stat" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=diff_stat, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+        aider = make_result(exit_code=0)
+        signals = collect_signals(aider, "/tmp/fake")
+        assert not signals.has_src_changes

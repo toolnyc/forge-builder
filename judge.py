@@ -60,6 +60,10 @@ class JudgeSignals:
     lines_removed: int = 0
     ruff_errors: int = 0
     ruff_files: list[str] = field(default_factory=list)
+    build_exit_code: int | None = None  # None = no build command detected
+    build_errors: str = ""
+    lint_errors: int = 0  # generic lint (ruff, eslint, etc.)
+    lint_files: list[str] = field(default_factory=list)
     has_token_error: bool = False
     has_context_error: bool = False
     has_file_not_found: bool = False
@@ -98,16 +102,28 @@ _TODO_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Source file extensions recognized across languages
+_SRC_EXTENSIONS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".rs", ".go", ".java", ".rb", ".swift", ".kt",
+    ".c", ".cpp", ".h", ".hpp", ".cs",
+)
+_TEST_PATTERNS = ("test_", ".test.", ".spec.", "_test.", "__tests__")
+
 
 # ---------------------------------------------------------------------------
 # Signal collectors (all free — no LLM calls)
 # ---------------------------------------------------------------------------
 
 def _collect_git_diff_signals(signals: JudgeSignals, repo_dir: str):
-    """Parse git diff --stat to count changed files and lines."""
+    """Parse git diff --stat to count changed files and lines.
+
+    Diffs against origin/main to capture both committed (aider auto-commits)
+    and uncommitted changes on the feature branch.
+    """
     try:
         result = subprocess.run(
-            ["git", "diff", "--stat", "HEAD"],
+            ["git", "diff", "--stat", "origin/main"],
             capture_output=True, text=True, cwd=repo_dir,
         )
         output = result.stdout.strip()
@@ -123,7 +139,10 @@ def _collect_git_diff_signals(signals: JudgeSignals, repo_dir: str):
             if len(parts) >= 1:
                 filepath = parts[0].strip()
                 signals.files_changed += 1
-                if filepath.endswith(".py") and not filepath.endswith("test_"):
+                if (
+                    any(filepath.endswith(ext) for ext in _SRC_EXTENSIONS)
+                    and not any(pat in filepath for pat in _TEST_PATTERNS)
+                ):
                     signals.has_src_changes = True
 
         summary_match = re.search(
@@ -143,9 +162,9 @@ def _collect_git_diff_signals(signals: JudgeSignals, repo_dir: str):
 def _collect_ruff_signals(signals: JudgeSignals, repo_dir: str):
     """Run ruff check on changed .py files only."""
     try:
-        # Get list of changed python files
+        # Get list of changed python files vs branch point
         result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--name-only", "origin/main"],
             capture_output=True, text=True, cwd=repo_dir,
         )
         py_files = [
@@ -174,6 +193,76 @@ def _collect_ruff_signals(signals: JudgeSignals, repo_dir: str):
         log.debug("Failed to collect ruff signals", exc_info=True)
 
 
+def _detect_build_command(repo_dir: str) -> list[str] | None:
+    """Detect the project's build command from config files."""
+    root = Path(repo_dir)
+
+    # Node.js / Next.js / etc.
+    pkg_json = root / "package.json"
+    if pkg_json.exists():
+        try:
+            pkg = json.loads(pkg_json.read_text())
+            scripts = pkg.get("scripts", {})
+            if "build" in scripts:
+                # Prefer npm if package-lock.json exists, else try yarn/pnpm
+                if (root / "pnpm-lock.yaml").exists():
+                    return ["pnpm", "run", "build"]
+                if (root / "yarn.lock").exists():
+                    return ["yarn", "build"]
+                return ["npm", "run", "build"]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Rust
+    if (root / "Cargo.toml").exists():
+        return ["cargo", "check"]
+
+    # Go
+    if (root / "go.mod").exists():
+        return ["go", "build", "./..."]
+
+    # Python (if there's a pyproject.toml with build)
+    if (root / "pyproject.toml").exists():
+        return None  # ruff handles Python; skip generic build
+
+    return None
+
+
+def _collect_build_signals(signals: JudgeSignals, repo_dir: str):
+    """Run the project's build command and capture pass/fail."""
+    if not signals.has_changes:
+        return
+
+    build_cmd = _detect_build_command(repo_dir)
+    if not build_cmd:
+        return
+
+    try:
+        log.info("Running build check: %s", " ".join(build_cmd))
+        result = subprocess.run(
+            build_cmd,
+            capture_output=True, text=True, cwd=repo_dir,
+            timeout=300,  # 5 min max for build
+        )
+        signals.build_exit_code = result.returncode
+        if result.returncode != 0:
+            # Capture last 2000 chars of error output for hints
+            stderr = (result.stderr or "")[-2000:]
+            stdout = (result.stdout or "")[-2000:]
+            signals.build_errors = stderr or stdout
+            log.info("Build failed (exit %d)", result.returncode)
+        else:
+            log.info("Build passed")
+    except subprocess.TimeoutExpired:
+        signals.build_exit_code = 1
+        signals.build_errors = "Build timed out after 5 minutes"
+        log.info("Build timed out")
+    except FileNotFoundError:
+        log.debug("Build tool not found: %s", build_cmd[0])
+    except Exception:
+        log.debug("Build check failed", exc_info=True)
+
+
 def _collect_output_signals(signals: JudgeSignals, aider_result: AiderResult):
     """Scan aider stdout/stderr for known error patterns."""
     combined = (aider_result.stdout or "") + "\n" + (aider_result.stderr or "")
@@ -188,7 +277,7 @@ def _collect_todo_signals(signals: JudgeSignals, repo_dir: str):
     """Check if aider left TODO/blocked comments in the diff."""
     try:
         result = subprocess.run(
-            ["git", "diff", "HEAD"],
+            ["git", "diff", "origin/main"],
             capture_output=True, text=True, cwd=repo_dir,
         )
         matches = _TODO_RE.findall(result.stdout)
@@ -205,6 +294,7 @@ def collect_signals(aider_result: AiderResult, repo_dir: str) -> JudgeSignals:
 
     _collect_git_diff_signals(signals, repo_dir)
     _collect_ruff_signals(signals, repo_dir)
+    _collect_build_signals(signals, repo_dir)
     _collect_output_signals(signals, aider_result)
     _collect_todo_signals(signals, repo_dir)
 
@@ -319,7 +409,33 @@ def determine_verdict(
             signals=signals,
         )
 
-    # --- Exit OK, has changes, check quality ---
+    # --- Exit OK, has changes, check build ---
+    if signals.build_exit_code is not None and signals.build_exit_code != 0:
+        # Truncate build errors for the hint
+        error_snippet = signals.build_errors[:500] if signals.build_errors else ""
+        if attempt < MAX_RETRIES_PER_TIER:
+            return JudgeResult(
+                verdict=Verdict.FAIL_RETRY,
+                reason=f"Build failed (exit {signals.build_exit_code})",
+                signals=signals,
+                retry_hint=(
+                    f"The build failed. Fix these errors before finishing:\n"
+                    f"{error_snippet}"
+                ),
+            )
+        if is_last_tier:
+            return JudgeResult(
+                verdict=Verdict.GIVE_UP,
+                reason=f"Build failed — all tiers exhausted",
+                signals=signals,
+            )
+        return JudgeResult(
+            verdict=Verdict.ESCALATE,
+            reason=f"Build failed — retries exhausted at this tier",
+            signals=signals,
+        )
+
+    # --- Check lint quality ---
     if signals.ruff_errors > 3:
         if is_last_tier:
             # Still pass on highest tier — lint can be fixed in review
@@ -369,9 +485,29 @@ def determine_verdict(
         )
 
     # Has changes but no src changes (only config, docs, etc.)
+    # This is suspicious — most issues require source changes.
+    # Retry to push the model to actually write code.
+    if attempt < MAX_RETRIES_PER_TIER:
+        return JudgeResult(
+            verdict=Verdict.FAIL_RETRY,
+            reason="Only config/docs changes — no source code modified",
+            signals=signals,
+            retry_hint=(
+                "The previous attempt only modified config or documentation files "
+                "but didn't create or modify any source code files. "
+                "Re-read the issue and implement the required code changes."
+            ),
+        )
+    if is_last_tier:
+        # On last tier with retries exhausted, accept what we have
+        return JudgeResult(
+            verdict=Verdict.PASS,
+            reason="Pass — non-source changes only (retries exhausted, highest tier)",
+            signals=signals,
+        )
     return JudgeResult(
-        verdict=Verdict.PASS,
-        reason="Pass — non-source changes only",
+        verdict=Verdict.ESCALATE,
+        reason="Only config changes — model didn't write source code",
         signals=signals,
     )
 
