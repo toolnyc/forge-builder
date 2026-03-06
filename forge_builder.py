@@ -585,12 +585,18 @@ Instructions:
 # Post-aider fixups
 # ---------------------------------------------------------------------------
 
+# Match install commands on their own line (aider formats them in code blocks)
 _NPM_INSTALL_RE = re.compile(
-    r"(?:npm|pnpm|yarn)\s+(?:install|add)\s+((?:[\w@/._-]+\s*)+)",
+    r"^\s*(?:npm|pnpm|yarn)\s+(?:install|add)\s+(.+)$",
+    re.MULTILINE,
 )
 _PIP_INSTALL_RE = re.compile(
-    r"pip\s+install\s+([\w@/._ -]+)",
+    r"^\s*pip3?\s+install\s+(.+)$",
+    re.MULTILINE,
 )
+
+# Valid npm package name: lowercase, may start with @scope/
+_NPM_PKG_RE = re.compile(r"^(?:@[\w-]+/)?[a-z][\w._-]*$")
 
 
 def _auto_install_deps(aider_result: AiderResult):
@@ -615,10 +621,10 @@ def _auto_install_deps(aider_result: AiderResult):
         # Parse install commands from aider output
         packages = []
         for match in _NPM_INSTALL_RE.finditer(combined_output):
-            pkgs = match.group(1).strip().split()
-            for p in pkgs:
-                if not p.startswith("-") and p not in packages:
-                    packages.append(p)
+            for token in match.group(1).strip().split():
+                # Only accept tokens that look like valid npm package names
+                if _NPM_PKG_RE.match(token) and token not in packages:
+                    packages.append(token)
 
         if packages or "package.json" in changed:
             if (repo / "pnpm-lock.yaml").exists():
