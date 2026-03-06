@@ -1,0 +1,21 @@
+name: Deploy Builder
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            cd ~/forge-builder
+            git pull origin main
+            pip install -q -r requirements.txt
+            sudo systemctl restart forge-builder
