@@ -49,6 +49,24 @@ def _authorized(update: Update) -> bool:
     return str(update.effective_chat.id) == _cfg.telegram_chat_id
 
 
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    await update.message.reply_text(
+        "Forge Builder commands:\n\n"
+        "/status — current state, model, budget\n"
+        "/budget [daily|issue] [amt] — view or set budget\n"
+        "/model [model_string] — view or set model\n"
+        "/pause — pause the builder loop\n"
+        "/resume — resume the builder loop\n"
+        "/issues — list pending forge-build issues\n"
+        "/approve <PR#> — squash-merge a PR\n"
+        "/logs — last 10 budget log entries\n"
+        "/add <title> — create issue with forge-build label\n"
+        "/help — this message"
+    )
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -110,6 +128,13 @@ async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_KNOWN_MODEL_KEYWORDS = (
+    "claude", "sonnet", "opus", "haiku",
+    "deepseek", "groq", "mixtral", "llama", "ollama",
+    "gpt", "o1", "o3", "gemini", "qwen",
+)
+
+
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -117,6 +142,13 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args or []
     if args:
         new_model = args[0]
+        if not any(k in new_model.lower() for k in _KNOWN_MODEL_KEYWORDS):
+            await update.message.reply_text(
+                f"'{new_model}' doesn't look like a valid model string.\n"
+                f"Must contain one of: {', '.join(_KNOWN_MODEL_KEYWORDS)}\n"
+                f"Current model unchanged: {_state.get('default_model')}"
+            )
+            return
         _state.set("default_model", new_model)
         await update.message.reply_text(f"Model set to: {new_model}")
     else:
@@ -274,6 +306,8 @@ def start_bot(config: BuilderConfig, builder_state: BuilderState):
     app = Application.builder().token(config.telegram_bot_token).build()
     _app = app
 
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("model", cmd_model))
