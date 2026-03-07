@@ -147,7 +147,7 @@ async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _state.set("daily_budget_usd", val)
             from forge_builder import wake_builder
             wake_builder()
-            await update.message.reply_text(f"Daily budget set to ${val:.2f}")
+            await update.message.reply_text(f"Daily budget set to ${val:.2f} (saved, persists across restarts)")
         elif kind == "issue":
             _cfg.per_issue_budget_usd = val
             from forge_builder import wake_builder
@@ -190,7 +190,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _state.set("default_model", new_model)
         from forge_builder import wake_builder
         wake_builder()
-        await update.message.reply_text(f"Model set to: {new_model}\nBuilder woken — will use on next build.")
+        await update.message.reply_text(f"Model set to: {new_model} (saved, persists across restarts)\nBuilder woken — will use on next build.")
     else:
         await update.message.reply_text(f"Current model: {_state.get('default_model')}")
 

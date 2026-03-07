@@ -82,6 +82,12 @@ cfg = BuilderConfig()
 # Shared state (thread-safe, mutated by Telegram bot + builder loop)
 # ---------------------------------------------------------------------------
 
+_STATE_FILE = Path(os.getenv("FORGE_STATE_FILE", "/opt/forge/infra/builder/state.json"))
+
+# Fields that get persisted across restarts
+_PERSISTED_FIELDS = ("default_model", "daily_budget_usd", "current_repo", "current_repo_dir")
+
+
 @dataclass
 class BuilderState:
     paused: bool = False
@@ -99,9 +105,38 @@ class BuilderState:
     def set(self, attr: str, value):
         with self._lock:
             setattr(self, attr, value)
+        if attr in _PERSISTED_FIELDS:
+            self._save()
+
+    def _save(self):
+        """Persist overrides to disk."""
+        try:
+            data = {}
+            with self._lock:
+                for f in _PERSISTED_FIELDS:
+                    data[f] = getattr(self, f)
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        except Exception:
+            log.exception("Failed to save state")
+
+    def load(self):
+        """Load persisted overrides from disk."""
+        if not _STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(_STATE_FILE.read_text())
+            with self._lock:
+                for f in _PERSISTED_FIELDS:
+                    if f in data:
+                        setattr(self, f, data[f])
+            log.info("Loaded persisted state: %s", data)
+        except Exception:
+            log.exception("Failed to load state")
 
 
 state = BuilderState()
+state.load()
 
 # Wake-up event — Telegram commands can signal the builder to stop sleeping
 _wake_event = threading.Event()
@@ -829,6 +864,12 @@ def process_issue(issue: dict):
                         "Issue #%d hit per-issue cap ($%.2f spent)",
                         number, issue_spend,
                     )
+                    notify(
+                        "budget_cap",
+                        f"#{number} hit per-issue cap "
+                        f"(${issue_spend:.2f} / ${cfg.per_issue_budget_usd:.2f}).\n"
+                        f"Use /budget issue <amount> to raise the cap.",
+                    )
                     final_verdict = "give_up"
                     break
 
@@ -980,10 +1021,15 @@ def process_issue(issue: dict):
 
     except Exception as e:
         log.exception("Error processing issue #%d", number)
-        comment_on_issue(number, f"Forge Builder encountered an error:\n```\n{e}\n```")
+        error_msg = str(e)[:500]
+        comment_on_issue(number, f"Forge Builder encountered an error:\n```\n{error_msg}\n```")
         label_issue(number, remove=[cfg.label_in_progress])
         run_cmd(["git", "checkout", "main"], check=False)
-        notify("build_fail", f"Error on #{number}: {e}")
+        notify(
+            "build_error",
+            f"Error on #{number}: {title}\n{error_msg}\n"
+            f"Issue still has forge-build label — will retry next cycle.",
+        )
     finally:
         state.set("current_issue", None)
 
@@ -1108,7 +1154,12 @@ def builder_loop():
                 if issues_processed > 0:
                     post_run_summary()
                     issues_processed = 0
-                notify("budget_hit", f"Daily budget exhausted. ${get_daily_spend():.2f} spent.")
+                notify(
+                    "budget_hit",
+                    f"Daily budget exhausted (${get_daily_spend():.2f} / "
+                    f"${state.get('daily_budget_usd'):.2f}).\n"
+                    f"Use /budget daily <amount> to increase.",
+                )
                 _interruptible_sleep(cfg.poll_interval * 6)
                 continue
 
@@ -1140,9 +1191,10 @@ def builder_loop():
             if not any_affordable:
                 log.info("No affordable issues in queue. Sleeping longer...")
                 notify(
-                    "budget_hit",
-                    f"Can't afford any pending issues. "
-                    f"Budget: ${budget_remaining():.2f} remaining.",
+                    "budget_low",
+                    f"Can't afford any pending issues.\n"
+                    f"Budget: ${budget_remaining():.2f} remaining.\n"
+                    f"Use /budget daily <amount> or /budget issue <amount> to adjust.",
                 )
                 _interruptible_sleep(cfg.poll_interval * 6)
                 continue
