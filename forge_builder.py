@@ -65,6 +65,9 @@ class BuilderConfig:
     per_issue_budget_usd: float = float(os.getenv("FORGE_PER_ISSUE_BUDGET", "1.50"))
     budget_log: str = os.getenv("FORGE_BUDGET_LOG", "/opt/forge/infra/builder/budget.jsonl")
 
+    # --- Repo management ---
+    repos_dir: str = os.getenv("FORGE_REPOS_DIR", os.path.expanduser("~/repos"))
+
     # --- Schedule controls ---
     active_hours: str = os.getenv("FORGE_ACTIVE_HOURS", "")
 
@@ -85,6 +88,8 @@ class BuilderState:
     current_issue: dict | None = None
     daily_budget_usd: float = field(default_factory=lambda: cfg.daily_budget_usd)
     default_model: str = field(default_factory=lambda: cfg.default_model)
+    current_repo: str = field(default_factory=lambda: cfg.github_repo)
+    current_repo_dir: str = field(default_factory=lambda: cfg.repo_dir)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def get(self, attr: str):
@@ -170,6 +175,7 @@ def log_spend(issue_number: int, model: str, cost_usd: float, duration_s: float)
         "type": "spend",
         "date": _today_str(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "repo": state.get("current_repo"),
         "issue": issue_number,
         "model": model,
         "cost_usd": round(cost_usd, 4),
@@ -189,6 +195,7 @@ def log_judgment(
         "type": "judgment",
         "date": _today_str(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "repo": state.get("current_repo"),
         "issue": issue_number,
         "attempt": attempt,
         "model": model,
@@ -320,7 +327,7 @@ def run_cmd(
 ) -> subprocess.CompletedProcess:
     """Run a subprocess, logging the command."""
     log.debug("$ %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd or cfg.repo_dir)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd or state.get("current_repo_dir"))
     if check and result.returncode != 0:
         log.error(
             "Command failed: %s\nstdout: %s\nstderr: %s",
@@ -334,6 +341,66 @@ def gh(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a gh CLI command."""
     return run_cmd(["gh"] + args, **kwargs)
 
+
+# ---------------------------------------------------------------------------
+# Repo switching
+# ---------------------------------------------------------------------------
+
+def switch_repo(owner_name: str) -> str:
+    """Switch the builder to a different GitHub repo.
+
+    Validates the repo exists, clones if needed, and updates state.
+
+    Args:
+        owner_name: GitHub repo in "owner/name" format.
+
+    Returns:
+        Status message string.
+    """
+    if "/" not in owner_name or owner_name.count("/") != 1:
+        return f"Invalid format: '{owner_name}'. Expected owner/name."
+
+    owner, name = owner_name.split("/")
+
+    # Validate repo exists via gh
+    try:
+        subprocess.run(
+            ["gh", "repo", "view", owner_name, "--json", "name"],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError:
+        return f"Repo '{owner_name}' not found or not accessible."
+
+    repo_base = Path(cfg.repos_dir)
+    repo_dir = repo_base / owner / name
+
+    if repo_dir.exists():
+        # Already cloned — fetch latest
+        log.info("Repo %s already cloned at %s, fetching...", owner_name, repo_dir)
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        status_msg = f"Switched to {owner_name} (existing clone, fetched)"
+    else:
+        # Clone it
+        log.info("Cloning %s to %s...", owner_name, repo_dir)
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                ["gh", "repo", "clone", owner_name, str(repo_dir)],
+                capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            return f"Clone failed: {e.stderr[:300]}"
+        status_msg = f"Switched to {owner_name} (freshly cloned)"
+
+    state.set("current_repo", owner_name)
+    state.set("current_repo_dir", str(repo_dir))
+    log.info("Repo switched: %s → %s", owner_name, repo_dir)
+    return status_msg
+
+
 # ---------------------------------------------------------------------------
 # GitHub Issue management
 # ---------------------------------------------------------------------------
@@ -342,7 +409,7 @@ def fetch_pending_issues() -> list[dict]:
     """Get open issues labeled 'forge-build' that aren't already being worked on."""
     result = gh([
         "issue", "list",
-        "--repo", cfg.github_repo,
+        "--repo", state.get("current_repo"),
         "--label", cfg.label_pending,
         "--state", "open",
         "--json", "number,title,body,labels",
@@ -359,18 +426,18 @@ def label_issue(number: int, add: list[str] | None = None, remove: list[str] | N
     """Add/remove labels on an issue."""
     if add:
         for label in add:
-            gh(["issue", "edit", str(number), "--repo", cfg.github_repo, "--add-label", label])
+            gh(["issue", "edit", str(number), "--repo", state.get("current_repo"), "--add-label", label])
     if remove:
         for label in remove:
             gh(
-                ["issue", "edit", str(number), "--repo", cfg.github_repo, "--remove-label", label],
+                ["issue", "edit", str(number), "--repo", state.get("current_repo"), "--remove-label", label],
                 check=False,
             )
 
 
 def comment_on_issue(number: int, body: str):
     """Post a comment on an issue."""
-    gh(["issue", "comment", str(number), "--repo", cfg.github_repo, "--body", body])
+    gh(["issue", "comment", str(number), "--repo", state.get("current_repo"), "--body", body])
 
 # ---------------------------------------------------------------------------
 # Git helpers
@@ -447,12 +514,12 @@ Implements #{issue_number}
 {summary}
 
 ---
-Built autonomously by [Forge Builder](https://github.com/{cfg.github_repo}) using aider.
+Built autonomously by [Forge Builder](https://github.com/{state.get("current_repo")}) using aider.
 Review carefully before merging.
 """
     result = gh([
         "pr", "create",
-        "--repo", cfg.github_repo,
+        "--repo", state.get("current_repo"),
         "--base", "main",
         "--head", branch_name,
         "--title", f"[forge-build] {title}",
@@ -497,8 +564,9 @@ def run_aider(
     Returns:
         AiderResult with exit code, output, cost, and timing.
     """
-    repo_name = cfg.github_repo.split("/")[-1] if cfg.github_repo else "this project"
-    prompt = f"""You are working on {repo_name} ({cfg.github_repo}).
+    current_repo = state.get("current_repo")
+    repo_name = current_repo.split("/")[-1] if current_repo else "this project"
+    prompt = f"""You are working on {repo_name} ({current_repo}).
 
 Implement the following GitHub issue:
 
@@ -545,7 +613,7 @@ Instructions:
             cmd,
             capture_output=True,
             text=True,
-            cwd=cfg.repo_dir,
+            cwd=state.get("current_repo_dir"),
             timeout=1800,  # 30 min max per issue
         )
     except subprocess.TimeoutExpired:
@@ -606,7 +674,7 @@ def _auto_install_deps(aider_result: AiderResult):
     and then says "run: npm install foo bar". We parse that and run it.
     Also handles package.json/requirements.txt changes.
     """
-    repo = Path(cfg.repo_dir)
+    repo = Path(state.get("current_repo_dir"))
     combined_output = (aider_result.stdout or "") + "\n" + (aider_result.stderr or "")
 
     # Check what files changed
@@ -762,7 +830,7 @@ def process_issue(issue: dict):
 
                 aider_result = run_aider(issue, model, extra_context)
                 _auto_install_deps(aider_result)
-                signals = collect_signals(aider_result, cfg.repo_dir)
+                signals = collect_signals(aider_result, state.get("current_repo_dir"))
                 judge_result = determine_verdict(signals, attempt, tier_index)
 
                 # Optional LLM judge on suspicious PASSes
@@ -956,7 +1024,7 @@ def post_run_summary():
     try:
         gh([
             "issue", "create",
-            "--repo", cfg.github_repo,
+            "--repo", state.get("current_repo"),
             "--title", f"[build-summary] {today}",
             "--body", summary,
             "--label", "build-summary",
@@ -971,17 +1039,17 @@ def builder_loop():
     log.info(
         "Forge Builder starting — repo: %s, poll: %ds, daily_budget: $%.2f, "
         "per_issue: $%.2f, hours: %s, model: %s",
-        cfg.github_repo, cfg.poll_interval, cfg.daily_budget_usd,
+        state.get("current_repo"), cfg.poll_interval, cfg.daily_budget_usd,
         cfg.per_issue_budget_usd, cfg.active_hours or "always",
         cfg.default_model,
     )
 
-    if not cfg.github_repo:
+    if not state.get("current_repo"):
         log.error("FORGE_GITHUB_REPO not set. Exiting.")
         sys.exit(1)
 
-    if not Path(cfg.repo_dir).exists():
-        log.error("Repo dir %s does not exist. Exiting.", cfg.repo_dir)
+    if not Path(state.get("current_repo_dir")).exists():
+        log.error("Repo dir %s does not exist. Exiting.", state.get("current_repo_dir"))
         sys.exit(1)
 
     issues_processed = 0

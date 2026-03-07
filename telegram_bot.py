@@ -2,7 +2,8 @@
 """Forge Builder — Telegram bot for remote control.
 
 Commands:
-    /status  — paused/building/idle, current issue, budget remaining, model
+    /status  — paused/building/idle, current issue, budget remaining, model, repo
+    /repo [owner/name] — view or switch target repo
     /budget [daily|issue] [amount] — view or set budget
     /model [model_string] — view or set model
     /pause / /resume — control builder loop
@@ -54,7 +55,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Forge Builder commands:\n\n"
-        "/status — current state, model, budget\n"
+        "/status — current state, model, budget, repo\n"
+        "/repo [owner/name] — view or switch target repo\n"
         "/budget [daily|issue] [amt] — view or set budget\n"
         "/model [model_string] — view or set model\n"
         "/pause — pause the builder loop\n"
@@ -87,12 +89,44 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         status_str = "IDLE"
 
+    repo = _state.get("current_repo")
     msg = (
         f"Status: {status_str}\n"
+        f"Repo: {repo}\n"
         f"Model: {model}\n"
         f"Budget: ${remaining:.2f} remaining (${spent:.2f} / ${daily:.2f})\n"
     )
     await update.message.reply_text(msg)
+
+
+async def cmd_repo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+
+    args = ctx.args or []
+    if not args:
+        repo = _state.get("current_repo")
+        repo_dir = _state.get("current_repo_dir")
+        await update.message.reply_text(f"Current repo: {repo}\nDir: {repo_dir}")
+        return
+
+    owner_name = args[0]
+    if "/" not in owner_name or owner_name.count("/") != 1:
+        await update.message.reply_text("Invalid format. Usage: /repo owner/name")
+        return
+
+    # Pause loop during switch
+    was_paused = _state.get("paused")
+    _state.set("paused", True)
+    await update.message.reply_text(f"Switching to {owner_name}...")
+
+    from forge_builder import switch_repo
+    result = switch_repo(owner_name)
+
+    if not was_paused:
+        _state.set("paused", False)
+
+    await update.message.reply_text(result)
 
 
 async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -177,7 +211,7 @@ async def cmd_issues(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = subprocess.run(
             [
                 "gh", "issue", "list",
-                "--repo", _cfg.github_repo,
+                "--repo", _state.get("current_repo"),
                 "--label", _cfg.label_pending,
                 "--state", "open",
                 "--json", "number,title",
@@ -209,7 +243,7 @@ async def cmd_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         subprocess.run(
             [
                 "gh", "pr", "merge", pr_num,
-                "--repo", _cfg.github_repo,
+                "--repo", _state.get("current_repo"),
                 "--squash", "--delete-branch",
             ],
             capture_output=True, text=True, check=True,
@@ -261,7 +295,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = subprocess.run(
             [
                 "gh", "issue", "create",
-                "--repo", _cfg.github_repo,
+                "--repo", _state.get("current_repo"),
                 "--title", title,
                 "--body", "Created via Forge Builder Telegram bot.",
                 "--label", _cfg.label_pending,
@@ -309,6 +343,7 @@ def start_bot(config: BuilderConfig, builder_state: BuilderState):
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("repo", cmd_repo))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("pause", cmd_pause))
