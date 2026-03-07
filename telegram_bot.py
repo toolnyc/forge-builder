@@ -145,9 +145,13 @@ async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if kind == "daily":
             _state.set("daily_budget_usd", val)
+            from forge_builder import wake_builder
+            wake_builder()
             await update.message.reply_text(f"Daily budget set to ${val:.2f}")
         elif kind == "issue":
             _cfg.per_issue_budget_usd = val
+            from forge_builder import wake_builder
+            wake_builder()
             await update.message.reply_text(f"Per-issue budget set to ${val:.2f}")
         else:
             await update.message.reply_text("Usage: /budget [daily|issue] [amount]")
@@ -184,7 +188,9 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         _state.set("default_model", new_model)
-        await update.message.reply_text(f"Model set to: {new_model}")
+        from forge_builder import wake_builder
+        wake_builder()
+        await update.message.reply_text(f"Model set to: {new_model}\nBuilder woken — will use on next build.")
     else:
         await update.message.reply_text(f"Current model: {_state.get('default_model')}")
 
@@ -200,7 +206,9 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     _state.set("paused", False)
-    await update.message.reply_text("Builder resumed.")
+    from forge_builder import wake_builder
+    wake_builder()
+    await update.message.reply_text("Builder resumed — waking up now.")
 
 
 async def cmd_issues(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

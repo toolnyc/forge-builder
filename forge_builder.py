@@ -103,6 +103,21 @@ class BuilderState:
 
 state = BuilderState()
 
+# Wake-up event — Telegram commands can signal the builder to stop sleeping
+_wake_event = threading.Event()
+
+
+def wake_builder():
+    """Signal the builder loop to wake up immediately."""
+    _wake_event.set()
+
+
+def _interruptible_sleep(seconds: float):
+    """Sleep that can be interrupted by wake_builder()."""
+    _wake_event.wait(timeout=seconds)
+    _wake_event.clear()
+
+
 # Notification callback — set by telegram_bot when active
 _notify_fn: Callable[[str, str], None] | None = None
 
@@ -786,6 +801,7 @@ def process_issue(issue: dict):
     branch_name = None
     total_attempts = 0
     final_verdict = None
+    judge_result = None
 
     try:
         branch_name = prepare_branch(number, title)
@@ -936,7 +952,7 @@ def process_issue(issue: dict):
             number,
             f"Forge Builder couldn't complete this issue after {total_attempts} attempts "
             f"across {len(chain)} model tiers.\n\n"
-            f"Last verdict: {judge_result.reason if judge_result else 'unknown'}\n"
+            f"Last verdict: {judge_result.reason if judge_result else 'budget exceeded before any attempt'}\n"
             f"Total cost: ${total_cost:.2f}\n\n"
             f"This may need a more specific description or manual implementation.",
         )
@@ -1058,7 +1074,7 @@ def builder_loop():
         try:
             # Pause gate (from Telegram /pause)
             if state.get("paused"):
-                time.sleep(cfg.poll_interval)
+                _interruptible_sleep(cfg.poll_interval)
                 continue
 
             # Schedule gate
@@ -1067,7 +1083,7 @@ def builder_loop():
                 if issues_processed > 0:
                     post_run_summary()
                     issues_processed = 0
-                time.sleep(cfg.poll_interval)
+                _interruptible_sleep(cfg.poll_interval)
                 continue
 
             # Budget gate
@@ -1081,7 +1097,7 @@ def builder_loop():
                     post_run_summary()
                     issues_processed = 0
                 notify("budget_hit", f"Daily budget exhausted. ${get_daily_spend():.2f} spent.")
-                time.sleep(cfg.poll_interval * 6)
+                _interruptible_sleep(cfg.poll_interval * 6)
                 continue
 
             log.info("Budget remaining today: $%.2f / $%.2f", remaining, state.get("daily_budget_usd"))
@@ -1092,7 +1108,7 @@ def builder_loop():
                 if issues_processed > 0:
                     post_run_summary()
                     issues_processed = 0
-                time.sleep(cfg.poll_interval)
+                _interruptible_sleep(cfg.poll_interval)
                 continue
 
             log.info("Found %d pending issue(s)", len(issues))
@@ -1116,7 +1132,7 @@ def builder_loop():
                     f"Can't afford any pending issues. "
                     f"Budget: ${budget_remaining():.2f} remaining.",
                 )
-                time.sleep(cfg.poll_interval * 6)
+                _interruptible_sleep(cfg.poll_interval * 6)
                 continue
 
         except KeyboardInterrupt:
@@ -1127,7 +1143,7 @@ def builder_loop():
         except Exception:
             log.exception("Unexpected error in main loop")
 
-        time.sleep(cfg.poll_interval)
+        _interruptible_sleep(cfg.poll_interval)
 
 
 def main():
