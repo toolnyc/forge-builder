@@ -264,6 +264,14 @@ def is_within_active_hours() -> bool:
 
 def can_afford_issue(issue: dict) -> tuple[bool, str]:
     """Pre-flight budget check. Returns (affordable, reason)."""
+    # Check per-issue spend first — if already over cap, skip immediately
+    issue_spend = get_issue_spend(issue["number"])
+    if issue_spend >= cfg.per_issue_budget_usd:
+        return False, (
+            f"Already spent ${issue_spend:.2f} "
+            f"(cap: ${cfg.per_issue_budget_usd:.2f})"
+        )
+
     model = pick_model(issue)
     ceiling = estimate_max_cost(model)
     remaining = budget_remaining()
@@ -956,7 +964,11 @@ def process_issue(issue: dict):
             f"Total cost: ${total_cost:.2f}\n\n"
             f"This may need a more specific description or manual implementation.",
         )
-        label_issue(number, remove=[cfg.label_in_progress])
+        label_issue(
+            number,
+            add=["forge-failed"],
+            remove=[cfg.label_in_progress, cfg.label_pending],
+        )
         run_cmd(["git", "checkout", "main"], check=False)
         if branch_name:
             run_cmd(["git", "branch", "-D", branch_name], check=False)
